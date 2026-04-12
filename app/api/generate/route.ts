@@ -2,7 +2,45 @@ import { NextRequest, NextResponse } from "next/server";
 
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 
-type RawFile = { filename: string; content: string };
+type RawFile = { filename: string; content: string; binary?: boolean };
+
+async function callGroq(prompt: string): Promise<string> {
+  const body = JSON.stringify({
+    model: "llama-3.3-70b-versatile",
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.2,
+    max_tokens: 3000,
+  });
+
+  const attempt = async () =>
+    fetch(GROQ_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body,
+    });
+
+  let res = await attempt();
+
+  if (res.status === 429) {
+    const errJson = await res.json().catch(() => ({}));
+    const msg: string = errJson?.error?.message ?? "";
+    const waitMatch = msg.match(/try again in ([0-9.]+)s/);
+    const waitMs = waitMatch ? Math.ceil(parseFloat(waitMatch[1]) * 1000) + 500 : 12000;
+    await new Promise((r) => setTimeout(r, waitMs));
+    res = await attempt();
+  }
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Groq error: ${err}`);
+  }
+
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content ?? "";
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -12,119 +50,109 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "No analysis provided" }, { status: 400 });
     }
 
-    const { stack, hasWagmi, hasViem, hasEthers, chains, tokens, existingDeps, entryFile } =
-      analysis;
+    const {
+      stack,
+      hasWagmi,
+      hasViem,
+      hasEthers,
+      chains,
+      tokens,
+      existingDeps,
+      entryFile,
+    } = analysis;
 
-    // Build context from original files (capped to avoid token overflow)
-    const originalContext = (originalFiles as RawFile[] ?? [])
-      .map((f) => `// FILE: ${f.filename}\n${f.content.slice(0, 800)}`)
-      .join("\n\n")
-      .slice(0, 10000);
+    const files = (originalFiles as RawFile[]) ?? [];
 
-    // Find existing package.json if present
-    const pkgFile = (originalFiles as RawFile[] ?? []).find(
-      (f) => f.filename === "package.json"
-    );
-
-    const prompt = `You are an expert Web3 developer agent specialising in LI.FI SDK integration.
-
-Your job is to inject a complete LI.FI integration into an existing project and return ALL project files — both the originals (modified where needed) and the new integration files.
-
-PROJECT DETAILS:
-- Stack: ${stack}
-- Entry file: ${entryFile}
-- Has wagmi: ${hasWagmi}
-- Has viem: ${hasViem}
-- Has ethers.js: ${hasEthers}
-- Chains: ${chains?.join(", ") || "ethereum, polygon"}
-- Tokens: ${tokens?.join(", ") || "USDC, ETH"}
-- Existing deps: ${existingDeps?.join(", ") || "none"}
-
-ORIGINAL PROJECT FILES (truncated for context):
-${originalContext}
-
-${pkgFile ? `CURRENT package.json:\n${pkgFile.content}` : ""}
-
-INSTRUCTIONS:
-1. Generate these NEW integration files with full content:
-   - lib/lifi/config.ts — LI.FI SDK config using createConfig() with detected chains
-   - hooks/useLiFiRoute.ts — hook using getRoutes() from @lifi/sdk
-   - hooks/useLiFiSwap.ts — hook using executeRoute() from @lifi/sdk
-   - LIFI_INTEGRATION.md — setup instructions for the developer
-
-2. Generate a MODIFIED package.json that adds "@lifi/sdk" and "@lifi/wallet-management" to dependencies.
-
-3. If the entry file (${entryFile}) exists in the project, generate a MODIFIED version of it that imports and initialises the LI.FI config at the top level.
-
-4. Use wagmi/viem patterns if hasWagmi is true. Use ethers patterns if hasEthers is true and hasWagmi is false.
-
-5. All new files must be TypeScript with proper types and JSDoc comments.
-
-Return ONLY a valid JSON object — no markdown fences, no explanation, just raw JSON:
-{
-  "files": [
-    { "filename": "lib/lifi/config.ts", "content": "full file content here" },
-    { "filename": "hooks/useLiFiRoute.ts", "content": "full file content here" },
-    { "filename": "hooks/useLiFiSwap.ts", "content": "full file content here" },
-    { "filename": "LIFI_INTEGRATION.md", "content": "full file content here" },
-    { "filename": "package.json", "content": "full modified package.json here" }
-  ],
-  "packageInstall": "npm install @lifi/sdk @lifi/wallet-management",
-  "envVars": ["NEXT_PUBLIC_LIFI_INTEGRATOR=my-app"]
-}
-
-IMPORTANT: Escape all quotes and special characters inside the content strings properly so the JSON is valid.`;
-
-    const response = await fetch(GROQ_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.2,
-        max_tokens: 8000,
-      }),
-    });
-
-    if (!response.ok) {
-      const err = await response.text();
-      throw new Error(`Groq error: ${err}`);
+    const fileMap = new Map<string, RawFile>();
+    for (const f of files) {
+      fileMap.set(f.filename, f);
     }
 
-    const groqData = await response.json();
-    const raw = groqData.choices?.[0]?.message?.content ?? "";
+    const pkgFile = fileMap.get("package.json");
+    const pkgContext = pkgFile ? pkgFile.content.slice(0, 400) : '{"dependencies":{}}';
+
+    const codeSnippet = files
+      .filter((f) => !f.binary && /\.(ts|tsx|js|jsx)$/.test(f.filename))
+      .slice(0, 5)
+      .map((f) => `// ${f.filename}\n${f.content.slice(0, 150)}`)
+      .join("\n")
+      .slice(0, 1500);
+
+    const walletNote = hasWagmi
+      ? "Use wagmi useWalletClient for getWalletClient in config"
+      : hasEthers
+      ? "Use ethers provider/signer pattern"
+      : "Use generic wallet client pattern";
+
+    // IMPORTANT: The prompt contains exact correct @lifi/sdk v3 code snippets
+    // so the AI copies them instead of hallucinating old API shapes
+    const prompt = `You are a Web3 code generator. Output ONLY raw JSON, no markdown, no explanation.
+
+PROJECT INFO:
+stack:${stack} | wagmi:${hasWagmi} | viem:${hasViem} | ethers:${hasEthers}
+chains:${(chains || ["ethereum", "polygon"]).join(",")}
+tokens:${(tokens || ["USDC", "ETH"]).join(",")}
+entry:${entryFile}
+deps:${(existingDeps || []).slice(0, 10).join(",")}
+wallet:${walletNote}
+
+package.json: ${pkgContext}
+code: ${codeSnippet}
+
+OUTPUT THIS JSON SHAPE:
+{"files":[{"filename":"lib/lifi/config.ts","content":"..."},{"filename":"hooks/useLiFiRoute.ts","content":"..."},{"filename":"hooks/useLiFiSwap.ts","content":"..."},{"filename":"LIFI_INTEGRATION.md","content":"..."},{"filename":"package.json","content":"..."}],"packageInstall":"npm install @lifi/sdk @lifi/wallet-management","envVars":["NEXT_PUBLIC_LIFI_INTEGRATOR=my-app"]}
+
+===CRITICAL: COPY THESE EXACT CODE PATTERNS. DO NOT MODIFY THE API CALLS.===
+
+lib/lifi/config.ts — USE EXACTLY THIS STRUCTURE:
+import { createConfig, EVM } from '@lifi/sdk';
+export const initLiFi = () => createConfig({
+  integrator: process.env.NEXT_PUBLIC_LIFI_INTEGRATOR ?? 'my-app',
+  providers: [EVM({ getWalletClient: async () => { throw new Error('Provide wallet client') } })],
+});
+FORBIDDEN: chainIds, chains, rpcUrls, network — these properties DO NOT EXIST in @lifi/sdk v3.
+
+hooks/useLiFiRoute.ts — getRoutes() signature is EXACTLY:
+import { getRoutes } from '@lifi/sdk';
+const result = await getRoutes({ fromChainId:number, toChainId:number, fromTokenAddress:string, toTokenAddress:string, fromAmount:string, fromAddress:string });
+const routes = result.routes; // RouteExtended[]
+
+hooks/useLiFiSwap.ts — executeRoute() signature is EXACTLY:
+import { executeRoute } from '@lifi/sdk';
+await executeRoute(route, { updateRouteHook: (r) => console.log(r.steps[0].execution?.status) });
+
+OTHER FILES:
+- LIFI_INTEGRATION.md: setup steps, env vars, usage examples
+- package.json: keep ALL existing content exactly, only add "@lifi/sdk":"^3.0.0" and "@lifi/wallet-management":"^3.0.0" to dependencies
+===END CRITICAL SECTION===`;
+
+    const raw = await callGroq(prompt);
     const cleaned = raw.replace(/```json|```/g, "").trim();
 
     let integrationResult;
     try {
       integrationResult = JSON.parse(cleaned);
     } catch {
-      throw new Error("Groq returned malformed JSON. Please try again.");
+      throw new Error("AI returned malformed JSON. Please try again.");
     }
-
-    // Merge: start with all original files, then overwrite/add with integration files
-    const originalMap = new Map<string, string>(
-      (originalFiles as RawFile[] ?? []).map((f) => [f.filename, f.content])
-    );
 
     for (const f of integrationResult.files ?? []) {
-      originalMap.set(f.filename, f.content);
+      fileMap.set(f.filename, { filename: f.filename, content: f.content, binary: false });
     }
 
-    const allFiles: RawFile[] = Array.from(originalMap.entries()).map(
-      ([filename, content]) => ({ filename, content })
-    );
+    const allFiles = Array.from(fileMap.values());
 
-    const result = {
-      files: allFiles,
-      packageInstall: integrationResult.packageInstall ?? "npm install @lifi/sdk @lifi/wallet-management",
-      envVars: integrationResult.envVars ?? ["NEXT_PUBLIC_LIFI_INTEGRATOR=my-app"],
-    };
-
-    return NextResponse.json({ result });
+    return NextResponse.json({
+      result: {
+        files: allFiles,
+        packageInstall:
+          integrationResult.packageInstall ??
+          "npm install @lifi/sdk @lifi/wallet-management",
+        envVars: integrationResult.envVars ?? ["NEXT_PUBLIC_LIFI_INTEGRATOR=my-app"],
+        newFileCount: integrationResult.files?.length ?? 0,
+        totalFileCount: allFiles.length,
+      },
+    });
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "Failed to generate integration";
     return NextResponse.json({ error: message }, { status: 500 });
